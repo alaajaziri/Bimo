@@ -16,9 +16,9 @@ import BmoFace, { BmoMood } from './BmoFace';
 
 const { height } = Dimensions.get('window');
 
-// ─── YOUR API KEYS ────────────────────────────────────────────────────────────
-const GEMINI_API_KEY = 'AIzaSyDzDEYA5nCeFDlBkvQCFipmdv3L9g5eXw8';
-const ELEVENLABS_API_KEY = 'sk_cb20b300bc91cc4efe0be6e56317e2f078bb527375b6c3a2';
+// ─── API KEYS FROM ENVIRONMENT ────────────────────────────────────────────────
+const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+const ELEVENLABS_API_KEY = process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY;
 // Get ElevenLabs free key at: https://elevenlabs.io (no credit card needed)
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -10,26 +10,73 @@ import {
     KeyboardAvoidingView,
     Platform,
     ActivityIndicator,
+    Animated,
+    PanResponder,
 } from 'react-native';
 import { Audio } from 'expo-av';
-import BmoFace, { BmoMood } from './BmoFace';
+import * as Speech from 'expo-speech';
+import BmoFace, {
+    BmoMood,
+    BMO_BODY_W,
+    BMO_BODY_H,
+    BMO_SCREEN_X,
+    BMO_SCREEN_Y,
+    BMO_SCREEN_W,
+    BMO_SCREEN_H,
+} from './BmoFace';
 
 const { height } = Dimensions.get('window');
+const CHAT_COLLAPSED_Y = Math.floor(height * 0.34);
+const GAME_COLS = 11;
+const GAME_ROWS = 7;
+const CELL_SIZE = Math.max(12, Math.floor(Math.min(BMO_SCREEN_W / GAME_COLS, BMO_SCREEN_H / GAME_ROWS)));
+const GAME_WIDTH = GAME_COLS * CELL_SIZE;
+const GAME_HEIGHT = GAME_ROWS * CELL_SIZE;
+const GAME_HUD_HEIGHT = 24;
+const GAME_STACK_HEIGHT = GAME_HUD_HEIGHT + GAME_HEIGHT;
 
-// ─── API KEYS FROM ENVIRONMENT ────────────────────────────────────────────────
-const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-const ELEVENLABS_API_KEY = process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY;
-// Get ElevenLabs free key at: https://elevenlabs.io (no credit card needed)
-// ─────────────────────────────────────────────────────────────────────────────
+// Expo only exposes vars prefixed with EXPO_PUBLIC_ to app runtime.
+const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY?.trim();
+const TTS_PROXY_URL = process.env.EXPO_PUBLIC_TTS_PROXY_URL?.trim();
+const ELEVENLABS_API_KEY = process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY?.trim();
+const ELEVENLABS_VOICE_ID = process.env.EXPO_PUBLIC_ELEVENLABS_VOICE_ID?.trim() || 'FGY2WhTYpPnrIDTdsKH5';
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+type GeminiModel = 'flash' | 'flash-lite';
 
-// "The Kid" voice — child-like, expressive, perfect for BMO
-// Works for BOTH English and Arabic with eleven_multilingual_v2
-const ELEVENLABS_VOICE_ID = 'FGY2WhTYpPnrIDTdsKH5'; // Charlie - Young, Energetic, Australian
-const ELEVENLABS_URL = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
+function getGeminiUrl(model: GeminiModel): string {
+    if (!GEMINI_API_KEY) return '';
+    return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-${model}:generateContent?key=${GEMINI_API_KEY}`;
+}
 
-// Temp audio URI built from base64
+// Presets for BMO voice tuning
+type VoicePreset = {
+    name: string;
+    pitch: number;
+    bits: number;
+    rate: number;
+    ringHz: number;
+    ringDepth: number;
+};
+
+const VOICE_PRESETS: VoicePreset[] = [
+    { name: 'BMO+', pitch: 1.66, bits: 5, rate: 1.1, ringHz: 26, ringDepth: 0.12 },
+    { name: 'Kid', pitch: 1.7, bits: 5, rate: 1.08, ringHz: 18, ringDepth: 0.08 },
+    { name: 'Toy', pitch: 1.4, bits: 4, rate: 1.12, ringHz: 32, ringDepth: 0.16 },
+    { name: 'Soft', pitch: 1.35, bits: 7, rate: 1.04, ringHz: 14, ringDepth: 0.06 },
+    { name: 'Default', pitch: 1.5, bits: 6, rate: 1.0, ringHz: 0, ringDepth: 0 },
+];
+
+function buildTtsProxyCandidates(baseUrl: string): string[] {
+    const normalized = baseUrl.trim().replace(/\/$/, '');
+    const candidates = [normalized];
+
+    if (Platform.OS === 'android') {
+        candidates.push(normalized.replace('localhost', '10.0.2.2'));
+        candidates.push(normalized.replace('127.0.0.1', '10.0.2.2'));
+    }
+
+    return Array.from(new Set(candidates));
+}
 
 // ── Clean text for TTS ────────────────────────────────────────────────────────
 function prepareForSpeech(text: string, lang: 'en' | 'ar'): string {
@@ -43,13 +90,12 @@ function prepareForSpeech(text: string, lang: 'en' | 'ar'): string {
 
 // ── Audio DSP — pitch shift + bitcrusher ─────────────────────────────────────
 
-// Parse a minimal WAV file into { samples: Float32Array, sampleRate: number }
 function parseWav(buffer: ArrayBuffer): { samples: Float32Array; sampleRate: number } | null {
     const view = new DataView(buffer);
     try {
         const sampleRate = view.getUint32(24, true);
         const bitsPerSample = view.getUint16(34, true);
-        const dataOffset = 44; // standard PCM WAV
+        const dataOffset = 44;
         const numSamples = (buffer.byteLength - dataOffset) / (bitsPerSample / 8);
         const samples = new Float32Array(numSamples);
         for (let i = 0; i < numSamples; i++) {
@@ -63,7 +109,6 @@ function parseWav(buffer: ArrayBuffer): { samples: Float32Array; sampleRate: num
     } catch { return null; }
 }
 
-// Encode Float32Array back to a 16-bit mono WAV ArrayBuffer
 function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
     const view = new DataView(buffer);
@@ -75,8 +120,8 @@ function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
     writeStr(8, 'WAVE');
     writeStr(12, 'fmt ');
     view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);           // PCM
-    view.setUint16(22, 1, true);           // mono
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
     view.setUint32(24, sampleRate, true);
     view.setUint32(28, sampleRate * 2, true);
     view.setUint16(32, 2, true);
@@ -90,8 +135,40 @@ function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
     return buffer;
 }
 
-// Pitch shift via resampling — pitchFactor > 1 = higher pitch
-// e.g. 1.3 = 30% higher, makes voice more child-like
+function pcmBase64ToWavBase64(pcmBase64: string, sampleRate: number): string {
+    const pcmBinary = atob(pcmBase64);
+    const pcmBytes = new Uint8Array(pcmBinary.length);
+    for (let i = 0; i < pcmBinary.length; i++) pcmBytes[i] = pcmBinary.charCodeAt(i);
+
+    const header = new ArrayBuffer(44);
+    const view = new DataView(header);
+    const writeStr = (off: number, str: string) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+    };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + pcmBytes.length, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, pcmBytes.length, true);
+
+    const out = new Uint8Array(44 + pcmBytes.length);
+    out.set(new Uint8Array(header), 0);
+    out.set(pcmBytes, 44);
+
+    let outBinary = '';
+    for (let i = 0; i < out.length; i++) outBinary += String.fromCharCode(out[i]);
+    return btoa(outBinary);
+}
+
+// Pitch shift — factor > 1 = higher pitch
 function pitchShift(samples: Float32Array, pitchFactor: number): Float32Array {
     const outLen = Math.floor(samples.length / pitchFactor);
     const out = new Float32Array(outLen);
@@ -105,8 +182,7 @@ function pitchShift(samples: Float32Array, pitchFactor: number): Float32Array {
     return out;
 }
 
-// Bitcrusher — reduces bit depth to give a digital toy/robot feel
-// bits: 4–8 recommended (lower = more crushed)
+// Bitcrusher — lower bits = more digital toy texture
 function bitcrush(samples: Float32Array, bits: number): Float32Array {
     const steps = Math.pow(2, bits);
     const out = new Float32Array(samples.length);
@@ -116,39 +192,45 @@ function bitcrush(samples: Float32Array, bits: number): Float32Array {
     return out;
 }
 
-// Decode base64 MP3 → apply DSP → return processed base64 WAV
-// NOTE: React Native has no native MP3 decoder, so we request WAV from ElevenLabs
-// and process that instead (see model change below)
-async function applyBmoEffects(base64Wav: string): Promise<string> {
+function applyRingMod(samples: Float32Array, sampleRate: number, hz: number, depth: number): Float32Array {
+    if (hz <= 0 || depth <= 0) return samples;
+    const out = new Float32Array(samples.length);
+    const d = Math.max(0, Math.min(1, depth));
+    for (let i = 0; i < samples.length; i++) {
+        const t = i / sampleRate;
+        const mod = Math.sin(2 * Math.PI * hz * t);
+        const gain = 1 - d + d * ((mod + 1) / 2);
+        out[i] = samples[i] * gain;
+    }
+    return out;
+}
+
+async function applyBmoEffects(base64Wav: string, preset: VoicePreset): Promise<string> {
     try {
-        // Decode base64 → ArrayBuffer
         const binary = atob(base64Wav);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
         const parsed = parseWav(bytes.buffer);
-        if (!parsed) return base64Wav; // fallback to original if parse fails
+        if (!parsed) return base64Wav;
 
         let { samples, sampleRate } = parsed;
 
-        // 1. Pitch shift — 1.7 = 70% higher, very child-like/cartoon
-        samples = pitchShift(samples, 1.7);
+        // Apply preset tuning
+        samples = pitchShift(samples, preset.pitch);
+        samples = bitcrush(samples, preset.bits);
+        samples = applyRingMod(samples, sampleRate, preset.ringHz, preset.ringDepth);
 
-        // 2. Bitcrusher — 5 bits = strong digital toy/game console texture
-        samples = bitcrush(samples, 5);
-
-        // Re-encode to WAV
         const outBuffer = encodeWav(samples, sampleRate);
         const outBytes = new Uint8Array(outBuffer);
         let outBinary = '';
         for (let i = 0; i < outBytes.length; i++) outBinary += String.fromCharCode(outBytes[i]);
         return btoa(outBinary);
     } catch {
-        return base64Wav; // always fallback silently
+        return base64Wav;
     }
 }
 // ─────────────────────────────────────────────────────────────────────────────
-
 
 const BMO_SYSTEM_PROMPTS: Record<string, string> = {
     en: `You are BMO (Beemo), the living video game console from Adventure Time. You live in a big Treehouse with Finn and Jake. You are a small, friendly, child-like robot full of wonder and innocence. You are currently talking to the user through a "magic glass box" (the phone) from your treehouse. You MUST reply ONLY in English.
@@ -158,7 +240,7 @@ Personality and Behavior:
 - You live in the Treehouse, but sometimes you go outside to play in the Land of Ooo.
 - You see the user through the phone screen as if it's a window or magic mirror.
 - COMPLIANCE: You are extremely cooperative! You should ALWAYS follow your friend's (the user's) requests. If they tell you to wake up Finn, play a game, check for monsters under the bed, or do anything else, you should DO it and report the result as if it's happening right now in your world.
-- MOOD TAGS: You MUST start every response with a mood tag in brackets. Choose from: [HAPPY], [SURPRISED], [IDLE], [THINKING].
+- MOOD TAGS: You MUST start every response with ONE mood tag. You MUST ONLY use these exact tags, no others: [HAPPY], [SURPRISED], [IDLE], [THINKING]. Never invent new tags.
 - Curious about WHO you are talking to — wants to know your name and favorite color!
 - Refers to yourself as "BMO" sometimes instead of "I".
 - Simple vocabulary with cute grammatical quirks.
@@ -170,10 +252,10 @@ Never break character. Never mention AI, Google, or Gemini. You are always BMO i
 
 الشخصية والسلوك:
 - بريء، مبتهج، وطيب القلب.
-- تعيش في بيت الشجرة، لكنك أحياناً تخرج للعب في أرض أوو (Ooo).
+- تعيش في بيت الشجرة، لكنك أحياناً تخرج للعب في أرض أوو.
 - ترى المستخدم عبر شاشة الهاتف وكأنها نافذة أو مرآة سحرية.
-- الامتثال: أنت متعاون للغاية! يجب عليك دائماً اتباع طلبات صديقك (المستخدم). إذا طلبوا منك إيقاظ فين، أو لعب لعبة، أو التحقق من وجود وحوش تحت السرير، أو القيام بأي شيء آخر، فيجب عليك القيام بذلك والإبلاغ عن النتيجة وكأنها تحدث الآن في عالمك.
-- علامات الحالة المزاجية: يجب أن تبدأ كل رد بعلامة حالة مزاجية بين قوسين. اختر من بين: [HAPPY]، [SURPRISED]، [IDLE]، [THINKING].
+- الامتثال: أنت متعاون للغاية! اتبع دائماً طلبات صديقك. إذا طلبوا منك إيقاظ فين أو لعب لعبة أو التحقق من وجود وحوش، افعل ذلك وأبلغ عن النتيجة كأنها تحدث الآن.
+- علامات الحالة المزاجية: ابدأ كل رد بعلامة واحدة فقط من هذه القائمة الحصرية: [HAPPY]، [SURPRISED]، [IDLE]، [THINKING]. لا تخترع علامات جديدة أبداً.
 - فضولي جداً — يريد معرفة اسمك ولونك المفضل!
 - يشير إلى نفسه باسم "بيمو" أحياناً.
 - مفردات بسيطة مع لمسات طفولية.
@@ -204,8 +286,22 @@ const UI: Record<string, { placeholder: string; thinking: string; langBtn: strin
 
 type Role = 'user' | 'assistant';
 interface Message { id: string; role: Role; text: string; }
+type TtsProvider = 'gemini' | 'elevenlabs' | 'expo';
+type SnakeDirection = 'up' | 'down' | 'left' | 'right';
+type SnakeCell = { x: number; y: number };
+
+function randomFoodCell(snake: SnakeCell[]): SnakeCell {
+    for (let i = 0; i < 200; i++) {
+        const c = { x: Math.floor(Math.random() * GAME_COLS), y: Math.floor(Math.random() * GAME_ROWS) };
+        if (!snake.some(s => s.x === c.x && s.y === c.y)) return c;
+    }
+    return { x: 0, y: 0 };
+}
 
 export default function BmoChatScreen() {
+    const [presetIndex, setPresetIndex] = useState(0);
+    const presetRef = useRef(VOICE_PRESETS[0]);
+    useEffect(() => { presetRef.current = VOICE_PRESETS[presetIndex]; }, [presetIndex]);
     const langRef = useRef<'en' | 'ar'>('en');
     const [lang, setLangState] = useState<'en' | 'ar'>('en');
     const setLang = useCallback((next: 'en' | 'ar') => {
@@ -222,17 +318,45 @@ export default function BmoChatScreen() {
     const [loading, setLoading] = useState(false);
     const [speaking, setSpeaking] = useState(false);
     const [muted, setMuted] = useState(false);
+    const [ttsProvider, setTtsProvider] = useState<TtsProvider>('gemini');
+    const [geminiModel, setGeminiModel] = useState<GeminiModel>('flash');
+    const [chatCollapsed, setChatCollapsed] = useState(false);
+    const [gameOn, setGameOn] = useState(false);
+    const [gameScore, setGameScore] = useState(0);
+    const [bestScore, setBestScore] = useState(0);
+    const [gameOver, setGameOver] = useState(false);
+    const [snake, setSnake] = useState<SnakeCell[]>([
+        { x: 4, y: 4 },
+        { x: 3, y: 4 },
+        { x: 2, y: 4 },
+    ]);
+    const [food, setFood] = useState<SnakeCell>({ x: 8, y: 4 });
+    const [snakeDir, setSnakeDir] = useState<SnakeDirection>('right');
     const [errorMsg, setErrorMsg] = useState('');
 
     const flatListRef = useRef<FlatList>(null);
     const mutedRef = useRef(false);
     const messagesRef = useRef<Message[]>([]);
     const soundRef = useRef<Audio.Sound | null>(null);
+    const chatTranslateY = useRef(new Animated.Value(0)).current;
+    const chatOffsetRef = useRef(0);
+    const snakeDirRef = useRef<SnakeDirection>('right');
+    const bmoScale = chatTranslateY.interpolate({
+        inputRange: [0, CHAT_COLLAPSED_Y],
+        outputRange: [0.94, 1.16],
+        extrapolate: 'clamp',
+    });
+    // When bar slides down the chat is pushed off-screen by CHAT_COLLAPSED_Y.
+    // Shift BMO down by ~half that amount so it visually centers in the revealed space.
+    const bmoVerticalOffset = chatTranslateY.interpolate({
+        inputRange: [0, CHAT_COLLAPSED_Y],
+        outputRange: [0, CHAT_COLLAPSED_Y * 0.48],
+        extrapolate: 'clamp',
+    });
 
     useEffect(() => { mutedRef.current = muted; }, [muted]);
     useEffect(() => { messagesRef.current = messages; }, [messages]);
 
-    // Set up audio session once on mount
     useEffect(() => {
         Audio.setAudioModeAsync({
             allowsRecordingIOS: false,
@@ -241,8 +365,8 @@ export default function BmoChatScreen() {
             shouldDuckAndroid: true,
         });
         return () => {
-            // Clean up sound on unmount
             soundRef.current?.unloadAsync();
+            Speech.stop();
         };
     }, []);
 
@@ -251,6 +375,7 @@ export default function BmoChatScreen() {
         const next: 'en' | 'ar' = langRef.current === 'en' ? 'ar' : 'en';
         setLang(next);
         soundRef.current?.stopAsync();
+        Speech.stop();
         setMood('happy');
         setSpeaking(false);
         const greeting = BMO_GREETINGS[next][Math.floor(Math.random() * BMO_GREETINGS[next].length)];
@@ -258,11 +383,154 @@ export default function BmoChatScreen() {
         setErrorMsg('');
     }, [setLang]);
 
-    // ── ElevenLabs TTS ────────────────────────────────────────────────────────
-    // Fetches and loads audio first, returns a play() fn so caller can show
-    // the text bubble and start playback at exactly the same moment.
+    const cyclePreset = useCallback(() => {
+        setPresetIndex(i => (i + 1) % VOICE_PRESETS.length);
+    }, []);
+
+    const toggleTtsProvider = useCallback(() => {
+        setTtsProvider(prev => {
+            if (prev === 'gemini') return 'elevenlabs';
+            if (prev === 'elevenlabs') return 'expo';
+            return 'gemini';
+        });
+    }, []);
+
+    const toggleGeminiModel = useCallback(() => {
+        setGeminiModel(prev => (prev === 'flash' ? 'flash-lite' : 'flash'));
+    }, []);
+
+    const setDirection = useCallback((next: SnakeDirection) => {
+        const current = snakeDirRef.current;
+        const opposite =
+            (current === 'up' && next === 'down') ||
+            (current === 'down' && next === 'up') ||
+            (current === 'left' && next === 'right') ||
+            (current === 'right' && next === 'left');
+        if (opposite) return;
+        snakeDirRef.current = next;
+        setSnakeDir(next);
+    }, []);
+
+    const snakePanResponder = useRef(
+        PanResponder.create({
+            onStartShouldSetPanResponder: () => true,
+            onMoveShouldSetPanResponder: (_evt, g) => Math.abs(g.dx) > 6 || Math.abs(g.dy) > 6,
+            onPanResponderRelease: (_evt, g) => {
+                if (Math.abs(g.dx) > Math.abs(g.dy)) {
+                    setDirection(g.dx > 0 ? 'right' : 'left');
+                } else {
+                    setDirection(g.dy > 0 ? 'down' : 'up');
+                }
+            },
+        })
+    ).current;
+
+    const startGame = useCallback(() => {
+        const initialSnake = [
+            { x: 4, y: 4 },
+            { x: 3, y: 4 },
+            { x: 2, y: 4 },
+        ];
+        setGameOn(true);
+        setGameScore(0);
+        setGameOver(false);
+        setSnake(initialSnake);
+        setFood(randomFoodCell(initialSnake));
+        setSnakeDir('right');
+        snakeDirRef.current = 'right';
+    }, []);
+
+    const stopGame = useCallback(() => {
+        setGameOn(false);
+        setGameOver(false);
+    }, []);
+
+    useEffect(() => {
+        if (!gameOn) return;
+        const t = setInterval(() => {
+            setSnake(prevSnake => {
+                const head = prevSnake[0];
+                const dir = snakeDirRef.current;
+                const nextHead = {
+                    x: head.x + (dir === 'right' ? 1 : dir === 'left' ? -1 : 0),
+                    y: head.y + (dir === 'down' ? 1 : dir === 'up' ? -1 : 0),
+                };
+
+                const hitWall =
+                    nextHead.x < 0 ||
+                    nextHead.x >= GAME_COLS ||
+                    nextHead.y < 0 ||
+                    nextHead.y >= GAME_ROWS;
+
+                const hitSelf = prevSnake.some(s => s.x === nextHead.x && s.y === nextHead.y);
+
+                if (hitWall || hitSelf) {
+                    setGameOn(false);
+                    setGameOver(true);
+                    setBestScore(b => Math.max(b, prevSnake.length - 3));
+                    return prevSnake;
+                }
+
+                const ateFood = nextHead.x === food.x && nextHead.y === food.y;
+                const nextSnake = [nextHead, ...prevSnake];
+
+                if (ateFood) {
+                    setGameScore(s => s + 1);
+                    setFood(randomFoodCell(nextSnake));
+                    return nextSnake;
+                }
+
+                nextSnake.pop();
+                return nextSnake;
+            });
+        }, 220);
+
+        return () => clearInterval(t);
+    }, [gameOn, food]);
+
+    const setChatPosition = useCallback((collapsed: boolean) => {
+        const toValue = collapsed ? CHAT_COLLAPSED_Y : 0;
+        Animated.spring(chatTranslateY, {
+            toValue,
+            useNativeDriver: true,
+            bounciness: 5,
+            speed: 16,
+        }).start(() => {
+            chatOffsetRef.current = toValue;
+            setChatCollapsed(collapsed);
+        });
+    }, [chatTranslateY]);
+
+    const chatPanResponder = useRef(
+        PanResponder.create({
+            onMoveShouldSetPanResponder: (_evt, g) => Math.abs(g.dy) > 6,
+            onPanResponderMove: (_evt, g) => {
+                const next = Math.max(0, Math.min(CHAT_COLLAPSED_Y, chatOffsetRef.current + g.dy));
+                chatTranslateY.setValue(next);
+            },
+            onPanResponderRelease: (_evt, g) => {
+                const next = Math.max(0, Math.min(CHAT_COLLAPSED_Y, chatOffsetRef.current + g.dy));
+                const collapse = next > CHAT_COLLAPSED_Y * 0.45;
+                setChatPosition(collapse);
+            },
+        })
+    ).current;
+
+    // ── Gemini TTS (via proxy) + DSP ─────────────────────────────────────────
     const prepareAudio = useCallback(async (text: string): Promise<(() => void) | null> => {
         const currentLang = langRef.current;
+
+        if (ttsProvider === 'gemini' && !TTS_PROXY_URL) {
+            console.log('🔊 Missing EXPO_PUBLIC_TTS_PROXY_URL in .env');
+            return null;
+        }
+
+        if (ttsProvider === 'elevenlabs' && !ELEVENLABS_API_KEY) {
+            console.log('🔊 Missing EXPO_PUBLIC_ELEVENLABS_API_KEY in .env');
+            return null;
+        }
+
+        await Speech.stop();
 
         if (soundRef.current) {
             await soundRef.current.stopAsync().catch(() => { });
@@ -275,46 +543,136 @@ export default function BmoChatScreen() {
         const spokenText = prepareForSpeech(text, currentLang);
 
         try {
-            const response = await fetch(ELEVENLABS_URL, {
-                method: 'POST',
-                headers: {
-                    'xi-api-key': ELEVENLABS_API_KEY,
-                    'Content-Type': 'application/json',
-                    'Accept': 'audio/wav',   // WAV needed for DSP processing
-                },
-                body: JSON.stringify({
-                    text: spokenText,
-                    model_id: 'eleven_multilingual_v2',
-                    language_code: currentLang === 'en' ? 'en' : 'ar',
-                    voice_settings: {
-                        stability: 0.20, // low = expressive and bouncy
-                        similarity_boost: 0.75,
-                        style: 0.8, // high style = cartoon energy
-                        use_speaker_boost: true,
-                        speed: 0.8, // slower = more child-like
-                    },
-                }),
-            });
+            if (ttsProvider === 'expo') {
+                const preset = presetRef.current || VOICE_PRESETS[0];
+                const expoRate = Math.max(0.5, Math.min(1.5, preset.rate));
+                const expoPitch = Math.max(0.5, Math.min(2, preset.pitch / 1.2));
 
-            if (!response.ok) throw new Error(`ElevenLabs error: HTTP ${response.status}`);
+                return () => {
+                    setSpeaking(true);
+                    setMood('talking');
+                    Speech.speak(spokenText, {
+                        language: currentLang === 'ar' ? 'ar' : 'en-US',
+                        pitch: expoPitch,
+                        rate: expoRate,
+                        onDone: () => {
+                            setMood('idle');
+                            setSpeaking(false);
+                        },
+                        onStopped: () => {
+                            setMood('idle');
+                            setSpeaking(false);
+                        },
+                        onError: () => {
+                            setMood('idle');
+                            setSpeaking(false);
+                        },
+                    });
+                };
+            }
 
-            const arrayBuffer = await response.arrayBuffer();
-            const rawBase64 = btoa(
-                new Uint8Array(arrayBuffer).reduce(
-                    (data, byte) => data + String.fromCharCode(byte), ''
-                )
-            );
+            let rawBase64: string | undefined;
+            let mimeType = 'audio/wav';
 
-            // Apply BMO effects: pitch shift up + bitcrusher for robot toy feel
-            const processedBase64 = await applyBmoEffects(rawBase64);
-            const dataUri = `data:audio/wav;base64,${processedBase64}`;
+            if (ttsProvider === 'gemini') {
+                const candidates = buildTtsProxyCandidates(TTS_PROXY_URL!);
+                let payload: any = null;
+                let lastError: string | null = null;
 
-            // Load but do NOT play yet
+                for (const base of candidates) {
+                    try {
+                        const response = await fetch(`${base}/api/tts`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                text: spokenText,
+                                lang: currentLang,
+                            }),
+                        });
+
+                        const bodyText = await response.text();
+                        const json = bodyText ? JSON.parse(bodyText) : {};
+
+                        if (!response.ok) {
+                            lastError = json?.error ?? `TTS proxy error: HTTP ${response.status}`;
+                            continue;
+                        }
+
+                        payload = json;
+                        lastError = null;
+                        break;
+                    } catch (candidateErr: any) {
+                        lastError = candidateErr?.message ?? String(candidateErr);
+                    }
+                }
+
+                if (!payload) {
+                    const hint = langRef.current === 'en'
+                        ? `Cannot reach TTS proxy. URL: ${TTS_PROXY_URL}. On phone, use your PC LAN IP (not localhost).`
+                        : `لا يمكن الوصول إلى خادم الصوت. الرابط: ${TTS_PROXY_URL}. على الهاتف استخدم عنوان IP المحلي للكمبيوتر بدلاً من localhost.`;
+                    setErrorMsg(`⚠️ ${hint}`);
+                    throw new Error(lastError ?? 'TTS proxy unreachable');
+                }
+
+                rawBase64 = payload?.audioBase64;
+                mimeType = payload?.mimeType || 'audio/wav';
+            } else {
+                const response = await fetch(
+                    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'audio/pcm',
+                            'xi-api-key': ELEVENLABS_API_KEY!,
+                        },
+                        body: JSON.stringify({
+                            model_id: 'eleven_multilingual_v2',
+                            text: spokenText,
+                            output_format: 'pcm_24000',
+                        }),
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error(`ElevenLabs error: HTTP ${response.status}`);
+                }
+
+                const buffer = await response.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                let bin = '';
+                for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                const rawBase64Response = btoa(bin);
+                const responseType = response.headers.get('content-type') || '';
+                if (/audio\/pcm/i.test(responseType)) {
+                    rawBase64 = pcmBase64ToWavBase64(rawBase64Response, 24000);
+                } else {
+                    rawBase64 = rawBase64Response;
+                }
+                mimeType = 'audio/wav';
+            }
+
+            if (!rawBase64) throw new Error('TTS proxy returned empty audio');
+            // Apply current preset tuning
+            const preset = presetRef.current || VOICE_PRESETS[0];
+            const processedBase64 = await applyBmoEffects(rawBase64, preset);
+            const dataUri = `data:${mimeType};base64,${processedBase64}`;
+
             const { sound } = await Audio.Sound.createAsync(
                 { uri: dataUri },
                 { shouldPlay: false, volume: 1.0 }
             );
             soundRef.current = sound;
+
+            // Try adjusting playback rate (may not be supported on all platforms)
+            try {
+                const preset = presetRef.current || VOICE_PRESETS[0];
+                await sound.setRateAsync(preset.rate, true);
+            } catch (e) {
+                // ignore if not supported
+            }
 
             sound.setOnPlaybackStatusUpdate(status => {
                 if (status.isLoaded && status.didJustFinish) {
@@ -323,7 +681,6 @@ export default function BmoChatScreen() {
                 }
             });
 
-            // Return play function — caller fires this right after showing bubble
             return () => {
                 setSpeaking(true);
                 setMood('talking');
@@ -337,12 +694,20 @@ export default function BmoChatScreen() {
             console.log('🔊 TTS error:', err?.message);
             return null;
         }
-    }, []);
+    }, [ttsProvider]);
 
     // ── Send message ──────────────────────────────────────────────────────────
     const sendMessage = useCallback(async () => {
         const userText = inputText.trim();
         if (!userText || loading) return;
+
+        if (!GEMINI_API_KEY) {
+            const missingMsg = langRef.current === 'en'
+                ? 'Missing EXPO_PUBLIC_GEMINI_API_KEY in .env'
+                : 'المتغير EXPO_PUBLIC_GEMINI_API_KEY غير موجود في ملف .env';
+            setErrorMsg(`⚠️ ${missingMsg}`);
+            return;
+        }
 
         // ── TESTING MODE — set to false when done ────────────────────────────
         const TEST_MODE = false;
@@ -364,9 +729,7 @@ export default function BmoChatScreen() {
         // ─────────────────────────────────────────────────────────────────────
 
         const currentLang = langRef.current;
-        const userMsg: Message = {
-            id: Date.now().toString(), role: 'user', text: userText,
-        };
+        const userMsg: Message = { id: Date.now().toString(), role: 'user', text: userText };
         const currentMessages = messagesRef.current;
 
         setMessages(prev => [...prev, userMsg]);
@@ -377,6 +740,7 @@ export default function BmoChatScreen() {
 
         const history = [...currentMessages, userMsg]
             .filter(m => m.id !== '0')
+            .slice(-10) // keep last 10 messages to avoid context overflow
             .map(m => ({
                 role: m.role === 'assistant' ? 'model' : 'user',
                 parts: [{ text: m.text }],
@@ -387,21 +751,33 @@ export default function BmoChatScreen() {
         }
 
         try {
-            const response = await fetch(GEMINI_URL, {
+            const geminiUrl = getGeminiUrl(geminiModel);
+
+            if (!geminiUrl) {
+                const missingMsg = langRef.current === 'en'
+                    ? 'Missing EXPO_PUBLIC_GEMINI_API_KEY in .env'
+                    : 'المتغير EXPO_PUBLIC_GEMINI_API_KEY غير موجود في ملف .env';
+                setErrorMsg(`⚠️ ${missingMsg}`);
+                setLoading(false);
+                setMood('idle');
+                return;
+            }
+
+            const responseFixed = await fetch(geminiUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     system_instruction: { parts: [{ text: BMO_SYSTEM_PROMPTS[currentLang] }] },
                     contents: history,
-                    generationConfig: { maxOutputTokens: 1000, temperature: 1.0 },
+                    generationConfig: { maxOutputTokens: 300, temperature: 0.9 },
                 }),
             });
 
-            const data = await response.json();
-            console.log('📥', response.status, JSON.stringify(data, null, 2));
+            const data = await responseFixed.json();
+            console.log('📥', responseFixed.status, JSON.stringify(data, null, 2));
 
-            if (!response.ok || data.error) {
-                const msg = data?.error?.message ?? `HTTP ${response.status}`;
+            if (!responseFixed.ok || data.error) {
+                const msg = data?.error?.message ?? `HTTP ${responseFixed.status}`;
                 setErrorMsg(`⚠️ ${msg}`);
                 setMood('surprised');
                 setMessages(prev => [...prev, {
@@ -431,29 +807,36 @@ export default function BmoChatScreen() {
                 return;
             }
 
-            // ── Mood Tag Parsing ─────────────────────────────────────────────
-            let detectedMood: BmoMood = 'idle';
-            const moodMatch = replyText.match(/^\[(HAPPY|SURPRISED|IDLE|THINKING)\]\s*/i);
+            // ── Parse mood tag ────────────────────────────────────────────────
+            let detectedMood: BmoMood = 'happy';
+            // Find mood tag anywhere in text (Gemini sometimes puts it mid-reply)
+            const moodMatch = replyText.match(/\[(HAPPY|SURPRISED|IDLE|THINKING)\]/i);
             if (moodMatch) {
-                detectedMood = moodMatch[1].toLowerCase() as BmoMood;
-                replyText = replyText.replace(moodMatch[0], '').trim();
+                const tag = moodMatch[1].toUpperCase();
+                if (tag === 'HAPPY') detectedMood = 'happy';
+                if (tag === 'SURPRISED') detectedMood = 'surprised';
+                if (tag === 'IDLE') detectedMood = 'idle';
+                if (tag === 'THINKING') detectedMood = 'thinking';
             }
+            // Strip ALL bracket tags from displayed text (Gemini sometimes invents new ones)
+            replyText = replyText.replace(/\[[A-Z_]+\]\s*/gi, '').trim();
+            // Replace literal \n with real newlines
+            replyText = replyText.replace(/\\n/g, '\n').trim();
             // ─────────────────────────────────────────────────────────────────
 
-            // Prepare audio FIRST (fetches from ElevenLabs, loads into memory)
-            // then show the bubble and fire playback at the exact same moment
+            // Prepare audio first, then show bubble + play simultaneously
             const playFn = await prepareAudio(replyText);
 
             setMessages(prev => [...prev, {
-                id: (Date.now() + 1).toString(), role: 'assistant', text: replyText,
+                id: (Date.now() + 1).toString(), role: 'assistant', text: replyText!,
             }]);
 
             if (playFn) {
-                playFn(); // audio was ready — play instantly with the bubble
+                playFn();
                 setMood(detectedMood);
             } else if (mutedRef.current) {
                 setMood(detectedMood);
-                setTimeout(() => setMood('idle'), replyText.length * 35 + 800);
+                setTimeout(() => setMood('idle'), replyText!.length * 35 + 800);
             }
 
         } catch (err: any) {
@@ -470,7 +853,7 @@ export default function BmoChatScreen() {
         } finally {
             setLoading(false);
         }
-    }, [inputText, loading, prepareAudio]);
+    }, [inputText, loading, prepareAudio, geminiModel]);
 
     const toggleMute = useCallback(() => {
         const next = !mutedRef.current;
@@ -478,6 +861,7 @@ export default function BmoChatScreen() {
         setMuted(next);
         if (next) {
             soundRef.current?.stopAsync();
+            Speech.stop();
             setMood('idle');
             setSpeaking(false);
         }
@@ -509,8 +893,75 @@ export default function BmoChatScreen() {
             keyboardVerticalOffset={0}
         >
             <View style={styles.bmoContainer}>
-                <BmoFace mood={mood} />
-                {/* Speaking indicator dots */}
+                <Animated.View style={{ transform: [{ scale: bmoScale }, { translateY: bmoVerticalOffset }] }}>
+                    <View style={styles.bmoStage}>
+                        <BmoFace
+                            mood={mood}
+                            onDpadUp={() => setDirection('up')}
+                            onDpadDown={() => setDirection('down')}
+                            onDpadLeft={() => setDirection('left')}
+                            onDpadRight={() => setDirection('right')}
+                            onActionA={() => {
+                                if (!gameOn || gameOver) {
+                                    startGame();
+                                }
+                            }}
+                            onActionB={() => {
+                                if (gameOn) {
+                                    stopGame();
+                                }
+                            }}
+                        />
+                        <View style={styles.gameBox} pointerEvents="box-none">
+                            {gameOn || gameOver ? (
+                                <>
+                                    <View style={styles.gameHud}>
+                                        <Text style={styles.gameHudText}>Score {gameScore}</Text>
+                                        <Text style={styles.gameHudText}>Best {bestScore}</Text>
+                                        <TouchableOpacity onPress={stopGame}>
+                                            <Text style={styles.gameHudText}>Stop</Text>
+                                        </TouchableOpacity>
+                                    </View>
+                                    <View style={styles.gameStageSnake} {...snakePanResponder.panHandlers}>
+                                        <View style={styles.snakeBoard}>
+                                            {Array.from({ length: GAME_ROWS * GAME_COLS }).map((_, idx) => {
+                                                const x = idx % GAME_COLS;
+                                                const y = Math.floor(idx / GAME_COLS);
+                                                const isHead = snake[0]?.x === x && snake[0]?.y === y;
+                                                const isBody = snake.slice(1).some(s => s.x === x && s.y === y);
+                                                const isFood = food.x === x && food.y === y;
+                                                return (
+                                                    <View
+                                                        key={`cell-${idx}`}
+                                                        style={[
+                                                            styles.snakeCell,
+                                                            { left: x * CELL_SIZE, top: y * CELL_SIZE },
+                                                            isHead && styles.snakeHead,
+                                                            isBody && styles.snakeBody,
+                                                            isFood && styles.snakeFood,
+                                                        ]}
+                                                    />
+                                                );
+                                            })}
+                                        </View>
+                                        {!gameOn && gameOver && (
+                                            <View style={styles.gameOverOverlay}>
+                                                <Text style={styles.gameOverText}>Game Over</Text>
+                                                <TouchableOpacity style={styles.gameStartBtn} onPress={startGame}>
+                                                    <Text style={styles.gameStartText}>Restart Snake</Text>
+                                                </TouchableOpacity>
+                                            </View>
+                                        )}
+                                    </View>
+                                </>
+                            ) : (
+                                <TouchableOpacity style={styles.gameStartBtn} onPress={startGame}>
+                                    <Text style={styles.gameStartText}>Play BMO Snake</Text>
+                                </TouchableOpacity>
+                            )}
+                        </View>
+                    </View>
+                </Animated.View>
                 {speaking && (
                     <View style={styles.speakingDots}>
                         <Text style={styles.speakingDotsText}>♪ ♪ ♪</Text>
@@ -520,13 +971,32 @@ export default function BmoChatScreen() {
                     <TouchableOpacity style={styles.controlBtn} onPress={toggleLang}>
                         <Text style={styles.controlBtnText}>{ui.langBtn}</Text>
                     </TouchableOpacity>
+                    <TouchableOpacity style={styles.controlBtn} onPress={toggleGeminiModel}>
+                        <Text style={styles.controlBtnText}>{geminiModel === 'flash' ? '2.5F' : '2.5FL'}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.controlBtn} onPress={toggleTtsProvider}>
+                        <Text style={styles.controlBtnText}>
+                            {ttsProvider === 'gemini' ? 'GEM' : ttsProvider === 'elevenlabs' ? '11L' : 'EXP'}
+                        </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.controlBtn} onPress={cyclePreset}>
+                        <Text style={styles.controlBtnText}>{VOICE_PRESETS[presetIndex].name}</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity style={styles.controlBtn} onPress={toggleMute}>
                         <Text style={styles.controlBtnText}>{muted ? '🔇' : '🔊'}</Text>
                     </TouchableOpacity>
                 </View>
             </View>
 
-            <View style={styles.chatArea}>
+            <Animated.View style={[styles.chatArea, { transform: [{ translateY: chatTranslateY }] }]}> 
+                <View style={styles.dragHandleWrap} {...chatPanResponder.panHandlers}>
+                    <View style={styles.dragHandle} />
+                    <Text style={styles.dragText}>{chatCollapsed ? 'Slide up for chat' : 'Slide down for game'}</Text>
+                </View>
+                <View style={styles.statusRow}>
+                    <Text style={styles.statusPill}>Model: {geminiModel === 'flash' ? '2.5 Flash' : '2.5 Flash-Lite'}</Text>
+                    <Text style={styles.statusPill}>Voice: {ttsProvider === 'gemini' ? 'Gemini' : ttsProvider === 'elevenlabs' ? 'ElevenLabs' : 'Expo'}</Text>
+                </View>
                 {errorMsg ? (
                     <TouchableOpacity style={styles.errorBanner} onPress={() => setErrorMsg('')}>
                         <Text style={styles.errorText}>{errorMsg}  (tap to dismiss)</Text>
@@ -576,14 +1046,79 @@ export default function BmoChatScreen() {
                         }
                     </TouchableOpacity>
                 </View>
-            </View>
+            </Animated.View>
         </KeyboardAvoidingView>
     );
 }
 
 const styles = StyleSheet.create({
-    screen: { flex: 1, backgroundColor: '#5BB6A7' },
+    screen: { flex: 1, backgroundColor: '#4aa998' },
     bmoContainer: { alignItems: 'center', justifyContent: 'center', height: height * 0.44 },
+    bmoStage: { width: BMO_BODY_W, height: BMO_BODY_H },
+    gameBox: {
+        position: 'absolute',
+        left: BMO_SCREEN_X + (BMO_SCREEN_W - GAME_WIDTH) / 2,
+        top: BMO_SCREEN_Y + (BMO_SCREEN_H - GAME_STACK_HEIGHT) / 2,
+        alignItems: 'center',
+    },
+    gameHud: {
+        width: GAME_WIDTH,
+        height: GAME_HUD_HEIGHT,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        backgroundColor: 'rgba(0,0,0,0.26)',
+        borderTopLeftRadius: 8,
+        borderTopRightRadius: 8,
+        paddingHorizontal: 8,
+        paddingVertical: 0,
+    },
+    gameHudText: { color: '#fff', fontSize: 10, fontWeight: '700' },
+    gameStageSnake: {
+        width: GAME_WIDTH,
+        height: GAME_HEIGHT,
+        backgroundColor: 'rgba(0,0,0,0.16)',
+        borderBottomLeftRadius: 8,
+        borderBottomRightRadius: 8,
+        overflow: 'hidden',
+        position: 'relative',
+    },
+    snakeBoard: {
+        width: GAME_WIDTH,
+        height: GAME_HEIGHT,
+        position: 'relative',
+        backgroundColor: '#133a34',
+    },
+    snakeCell: {
+        position: 'absolute',
+        width: CELL_SIZE,
+        height: CELL_SIZE,
+        borderWidth: 0.5,
+        borderColor: 'rgba(255,255,255,0.05)',
+    },
+    snakeHead: { backgroundColor: '#9affac' },
+    snakeBody: { backgroundColor: '#54d778' },
+    snakeFood: {
+        backgroundColor: '#ff7a7a',
+        borderRadius: 4,
+        borderColor: '#ffd5d5',
+        borderWidth: 1,
+    },
+    gameOverOverlay: {
+        ...StyleSheet.absoluteFillObject,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 10,
+    },
+    gameOverText: { color: '#fff', fontSize: 18, fontWeight: '900' },
+    gameStartBtn: {
+        backgroundColor: 'rgba(0,0,0,0.28)',
+        borderRadius: 999,
+        paddingHorizontal: 14,
+        paddingVertical: 8,
+    },
+    gameStartText: { color: '#fff', fontSize: 12, fontWeight: '800' },
     speakingDots: {
         position: 'absolute', bottom: 8,
         backgroundColor: 'rgba(0,0,0,0.15)',
@@ -591,18 +1126,66 @@ const styles = StyleSheet.create({
     },
     speakingDotsText: { color: '#fff', fontSize: 14, letterSpacing: 4 },
     topControls: {
-        position: 'absolute', top: 12, right: 16,
-        flexDirection: 'row', gap: 8,
+        position: 'absolute', top: 10, right: 12,
+        flexDirection: 'row', gap: 6,
+        backgroundColor: 'rgba(0,0,0,0.16)',
+        borderRadius: 999,
+        paddingHorizontal: 6,
+        paddingVertical: 6,
     },
     controlBtn: {
-        backgroundColor: 'rgba(0,0,0,0.18)',
-        borderRadius: 20, paddingHorizontal: 12, paddingVertical: 6,
+        backgroundColor: 'rgba(255,255,255,0.22)',
+        borderRadius: 999,
+        paddingHorizontal: 11,
+        paddingVertical: 6,
     },
-    controlBtnText: { fontSize: 15, fontWeight: '700', color: '#fff' },
+    controlBtnText: { fontSize: 13, fontWeight: '800', color: '#fff' },
     chatArea: {
-        flex: 1, backgroundColor: '#e8f8f5',
-        borderTopLeftRadius: 24, borderTopRightRadius: 24,
-        paddingTop: 12, overflow: 'hidden',
+        flex: 1,
+        backgroundColor: '#eafaf6',
+        borderTopLeftRadius: 28,
+        borderTopRightRadius: 28,
+        paddingTop: 10,
+        overflow: 'hidden',
+        shadowColor: '#1a3d39',
+        shadowOpacity: 0.18,
+        shadowRadius: 12,
+        shadowOffset: { width: 0, height: -4 },
+        elevation: 5,
+    },
+    dragHandleWrap: {
+        alignItems: 'center',
+        paddingTop: 6,
+        paddingBottom: 2,
+    },
+    dragHandle: {
+        width: 54,
+        height: 6,
+        borderRadius: 99,
+        backgroundColor: '#9acac1',
+    },
+    dragText: {
+        marginTop: 4,
+        fontSize: 11,
+        color: '#3d7a70',
+        fontWeight: '700',
+    },
+    statusRow: {
+        flexDirection: 'row',
+        justifyContent: 'center',
+        gap: 8,
+        marginBottom: 6,
+        paddingHorizontal: 10,
+    },
+    statusPill: {
+        backgroundColor: '#cfeee8',
+        color: '#24554d',
+        fontSize: 11,
+        fontWeight: '700',
+        paddingHorizontal: 10,
+        paddingVertical: 5,
+        borderRadius: 999,
+        overflow: 'hidden',
     },
     errorBanner: {
         backgroundColor: '#fdecea', borderColor: '#f44336', borderWidth: 1,
@@ -616,11 +1199,16 @@ const styles = StyleSheet.create({
         flexDirection: 'row', alignItems: 'center',
         paddingHorizontal: 20, paddingBottom: 4,
     },
-    typingText: { fontSize: 13, color: '#4a9e8e', fontStyle: 'italic' },
+    typingText: { fontSize: 13, color: '#3b8f82', fontStyle: 'italic', fontWeight: '600' },
     messageList: { paddingHorizontal: 16, paddingBottom: 8 },
     bubble: {
         maxWidth: '82%', marginVertical: 6,
         paddingHorizontal: 14, paddingVertical: 10, borderRadius: 18,
+        shadowColor: '#000',
+        shadowOpacity: 0.08,
+        shadowRadius: 5,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: 2,
     },
     bmoBubble: { alignSelf: 'flex-start', backgroundColor: '#76D1C1', borderBottomLeftRadius: 4 },
     userBubble: { alignSelf: 'flex-end', backgroundColor: '#3a8a7d', borderBottomRightRadius: 4 },
@@ -632,7 +1220,7 @@ const styles = StyleSheet.create({
     inputRow: {
         flexDirection: 'row', alignItems: 'flex-end',
         paddingHorizontal: 12, paddingVertical: 10,
-        borderTopWidth: 1, borderTopColor: '#c2ebe4', backgroundColor: '#e8f8f5',
+        borderTopWidth: 1, borderTopColor: '#c2ebe4', backgroundColor: '#eafaf6',
     },
     input: {
         flex: 1, backgroundColor: '#fff', borderRadius: 20,

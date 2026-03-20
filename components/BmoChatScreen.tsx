@@ -34,10 +34,10 @@ const GAME_WIDTH = GAME_COLS * CELL_SIZE;
 const GAME_HEIGHT = GAME_ROWS * CELL_SIZE;
 const GAME_HUD_HEIGHT = 24;
 const GAME_STACK_HEIGHT = GAME_HUD_HEIGHT + GAME_HEIGHT;
+const BUTTON_CLICK_ASSET = require('../button-click.mp3');
 
 // Expo only exposes vars prefixed with EXPO_PUBLIC_ to app runtime.
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY?.trim();
-const TTS_PROXY_URL = process.env.EXPO_PUBLIC_TTS_PROXY_URL?.trim();
 const ELEVENLABS_API_KEY = process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY?.trim();
 const ELEVENLABS_VOICE_ID = process.env.EXPO_PUBLIC_ELEVENLABS_VOICE_ID?.trim() || 'FGY2WhTYpPnrIDTdsKH5';
 
@@ -65,18 +65,6 @@ const VOICE_PRESETS: VoicePreset[] = [
     { name: 'Soft', pitch: 1.35, bits: 7, rate: 1.04, ringHz: 14, ringDepth: 0.06 },
     { name: 'Default', pitch: 1.5, bits: 6, rate: 1.0, ringHz: 0, ringDepth: 0 },
 ];
-
-function buildTtsProxyCandidates(baseUrl: string): string[] {
-    const normalized = baseUrl.trim().replace(/\/$/, '');
-    const candidates = [normalized];
-
-    if (Platform.OS === 'android') {
-        candidates.push(normalized.replace('localhost', '10.0.2.2'));
-        candidates.push(normalized.replace('127.0.0.1', '10.0.2.2'));
-    }
-
-    return Array.from(new Set(candidates));
-}
 
 // ── Clean text for TTS ────────────────────────────────────────────────────────
 function prepareForSpeech(text: string, lang: 'en' | 'ar'): string {
@@ -338,6 +326,7 @@ export default function BmoChatScreen() {
     const mutedRef = useRef(false);
     const messagesRef = useRef<Message[]>([]);
     const soundRef = useRef<Audio.Sound | null>(null);
+    const uiSoundRef = useRef<Audio.Sound | null>(null);
     const chatTranslateY = useRef(new Animated.Value(0)).current;
     const chatOffsetRef = useRef(0);
     const snakeDirRef = useRef<SnakeDirection>('right');
@@ -364,10 +353,33 @@ export default function BmoChatScreen() {
             staysActiveInBackground: false,
             shouldDuckAndroid: true,
         });
+
         return () => {
             soundRef.current?.unloadAsync();
+            uiSoundRef.current?.unloadAsync();
             Speech.stop();
         };
+    }, []);
+
+    const playButtonClick = useCallback(async () => {
+        if (mutedRef.current) return;
+
+        try {
+            if (!uiSoundRef.current) {
+                const { sound } = await Audio.Sound.createAsync(
+                    BUTTON_CLICK_ASSET,
+                    { shouldPlay: true, volume: 0.35 }
+                );
+                uiSoundRef.current = sound;
+                return;
+            }
+
+            await uiSoundRef.current.stopAsync().catch(() => { });
+            await uiSoundRef.current.setPositionAsync(0).catch(() => { });
+            await uiSoundRef.current.playAsync().catch(() => { });
+        } catch {
+            // Ignore click sound failures to avoid affecting gameplay input.
+        }
     }, []);
 
     // ── Language toggle ───────────────────────────────────────────────────────
@@ -516,12 +528,12 @@ export default function BmoChatScreen() {
         })
     ).current;
 
-    // ── Gemini TTS (via proxy) + DSP ─────────────────────────────────────────
+    // ── Gemini/ElevenLabs/Expo TTS + DSP ────────────────────────────────────
     const prepareAudio = useCallback(async (text: string): Promise<(() => void) | null> => {
         const currentLang = langRef.current;
 
-        if (ttsProvider === 'gemini' && !TTS_PROXY_URL) {
-            console.log('🔊 Missing EXPO_PUBLIC_TTS_PROXY_URL in .env');
+        if (ttsProvider === 'gemini' && !GEMINI_API_KEY) {
+            console.log('🔊 Missing EXPO_PUBLIC_GEMINI_API_KEY in .env');
             return null;
         }
 
@@ -575,49 +587,57 @@ export default function BmoChatScreen() {
             let mimeType = 'audio/wav';
 
             if (ttsProvider === 'gemini') {
-                const candidates = buildTtsProxyCandidates(TTS_PROXY_URL!);
-                let payload: any = null;
-                let lastError: string | null = null;
+                const voiceName = currentLang === 'ar' ? 'Puck' : 'Sulafat';
 
-                for (const base of candidates) {
-                    try {
-                        const response = await fetch(`${base}/api/tts`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
+                const response = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${GEMINI_API_KEY}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [
+                                {
+                                    parts: [{ text: spokenText }],
+                                },
+                            ],
+                            generationConfig: {
+                                responseModalities: ['AUDIO'],
+                                speechConfig: {
+                                    voiceConfig: {
+                                        prebuiltVoiceConfig: { voiceName },
+                                    },
+                                },
                             },
-                            body: JSON.stringify({
-                                text: spokenText,
-                                lang: currentLang,
-                            }),
-                        });
-
-                        const bodyText = await response.text();
-                        const json = bodyText ? JSON.parse(bodyText) : {};
-
-                        if (!response.ok) {
-                            lastError = json?.error ?? `TTS proxy error: HTTP ${response.status}`;
-                            continue;
-                        }
-
-                        payload = json;
-                        lastError = null;
-                        break;
-                    } catch (candidateErr: any) {
-                        lastError = candidateErr?.message ?? String(candidateErr);
+                        }),
                     }
+                );
+
+                const data = await response.json();
+                if (!response.ok || data?.error) {
+                    const msg = data?.error?.message ?? `Gemini TTS error: HTTP ${response.status}`;
+                    throw new Error(msg);
                 }
 
-                if (!payload) {
-                    const hint = langRef.current === 'en'
-                        ? `Cannot reach TTS proxy. URL: ${TTS_PROXY_URL}. On phone, use your PC LAN IP (not localhost).`
-                        : `لا يمكن الوصول إلى خادم الصوت. الرابط: ${TTS_PROXY_URL}. على الهاتف استخدم عنوان IP المحلي للكمبيوتر بدلاً من localhost.`;
-                    setErrorMsg(`⚠️ ${hint}`);
-                    throw new Error(lastError ?? 'TTS proxy unreachable');
+                const candidate = data?.candidates?.[0];
+                const parts = candidate?.content?.parts || [];
+                const audioPart = parts.find((part: any) => part?.inlineData?.data);
+                const geminiBase64 = audioPart?.inlineData?.data;
+                const geminiMimeType = audioPart?.inlineData?.mimeType || 'audio/wav';
+
+                if (!geminiBase64) {
+                    throw new Error('Gemini TTS returned empty audio');
                 }
 
-                rawBase64 = payload?.audioBase64;
-                mimeType = payload?.mimeType || 'audio/wav';
+                // Gemini may return PCM (audio/L16); convert to WAV for expo-av.
+                if (/^audio\/L16/i.test(geminiMimeType)) {
+                    const rateMatch = /rate=(\d+)/i.exec(geminiMimeType || '');
+                    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+                    rawBase64 = pcmBase64ToWavBase64(geminiBase64, sampleRate);
+                    mimeType = 'audio/wav';
+                } else {
+                    rawBase64 = geminiBase64;
+                    mimeType = geminiMimeType;
+                }
             } else {
                 const response = await fetch(
                     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
@@ -654,10 +674,12 @@ export default function BmoChatScreen() {
                 mimeType = 'audio/wav';
             }
 
-            if (!rawBase64) throw new Error('TTS proxy returned empty audio');
-            // Apply current preset tuning
+            if (!rawBase64) throw new Error('TTS returned empty audio');
+            // Keep Gemini output natural; only apply BMO DSP to non-Gemini providers.
             const preset = presetRef.current || VOICE_PRESETS[0];
-            const processedBase64 = await applyBmoEffects(rawBase64, preset);
+            const processedBase64 = ttsProvider === 'gemini'
+                ? rawBase64
+                : await applyBmoEffects(rawBase64, preset);
             const dataUri = `data:${mimeType};base64,${processedBase64}`;
 
             const { sound } = await Audio.Sound.createAsync(
@@ -666,12 +688,14 @@ export default function BmoChatScreen() {
             );
             soundRef.current = sound;
 
-            // Try adjusting playback rate (may not be supported on all platforms)
-            try {
-                const preset = presetRef.current || VOICE_PRESETS[0];
-                await sound.setRateAsync(preset.rate, true);
-            } catch (e) {
-                // ignore if not supported
+            // Keep native playback rate for Gemini so it sounds natural.
+            if (ttsProvider !== 'gemini') {
+                try {
+                    const preset = presetRef.current || VOICE_PRESETS[0];
+                    await sound.setRateAsync(preset.rate, true);
+                } catch (e) {
+                    // ignore if not supported
+                }
             }
 
             sound.setOnPlaybackStatusUpdate(status => {
@@ -861,6 +885,7 @@ export default function BmoChatScreen() {
         setMuted(next);
         if (next) {
             soundRef.current?.stopAsync();
+            uiSoundRef.current?.stopAsync();
             Speech.stop();
             setMood('idle');
             setSpeaking(false);
@@ -897,16 +922,30 @@ export default function BmoChatScreen() {
                     <View style={styles.bmoStage}>
                         <BmoFace
                             mood={mood}
-                            onDpadUp={() => setDirection('up')}
-                            onDpadDown={() => setDirection('down')}
-                            onDpadLeft={() => setDirection('left')}
-                            onDpadRight={() => setDirection('right')}
+                            onDpadUp={() => {
+                                playButtonClick();
+                                setDirection('up');
+                            }}
+                            onDpadDown={() => {
+                                playButtonClick();
+                                setDirection('down');
+                            }}
+                            onDpadLeft={() => {
+                                playButtonClick();
+                                setDirection('left');
+                            }}
+                            onDpadRight={() => {
+                                playButtonClick();
+                                setDirection('right');
+                            }}
                             onActionA={() => {
+                                playButtonClick();
                                 if (!gameOn || gameOver) {
                                     startGame();
                                 }
                             }}
                             onActionB={() => {
+                                playButtonClick();
                                 if (gameOn) {
                                     stopGame();
                                 }
@@ -918,7 +957,7 @@ export default function BmoChatScreen() {
                                     <View style={styles.gameHud}>
                                         <Text style={styles.gameHudText}>Score {gameScore}</Text>
                                         <Text style={styles.gameHudText}>Best {bestScore}</Text>
-                                        <TouchableOpacity onPress={stopGame}>
+                                        <TouchableOpacity onPress={() => { playButtonClick(); stopGame(); }}>
                                             <Text style={styles.gameHudText}>Stop</Text>
                                         </TouchableOpacity>
                                     </View>
@@ -947,18 +986,14 @@ export default function BmoChatScreen() {
                                         {!gameOn && gameOver && (
                                             <View style={styles.gameOverOverlay}>
                                                 <Text style={styles.gameOverText}>Game Over</Text>
-                                                <TouchableOpacity style={styles.gameStartBtn} onPress={startGame}>
+                                                <TouchableOpacity style={styles.gameStartBtn} onPress={() => { playButtonClick(); startGame(); }}>
                                                     <Text style={styles.gameStartText}>Restart Snake</Text>
                                                 </TouchableOpacity>
                                             </View>
                                         )}
                                     </View>
                                 </>
-                            ) : (
-                                <TouchableOpacity style={styles.gameStartBtn} onPress={startGame}>
-                                    <Text style={styles.gameStartText}>Play BMO Snake</Text>
-                                </TouchableOpacity>
-                            )}
+                            ) : null}
                         </View>
                     </View>
                 </Animated.View>
